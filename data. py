@@ -1,0 +1,731 @@
+"""
+data.py — FIXED & FAST REAL WIKIPEDIA
+- Batch Wikipedia API (20 titles/call)
+- stdlib-only (no pyarrow, no datasets)
+- Bug-fixed and cleaned up
+
+Author: (refactored)
+"""
+from __future__ import annotations
+
+import json
+import os
+import random
+import re
+from collections import Counter
+from functools import partial
+from typing import Dict, List, Optional, Sequence, Tuple
+
+import torch
+from torch.utils.data import DataLoader, Dataset
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+GAMMA_NLI = 0.3
+ALPHA_MAX = 0.95
+SPECIAL_TOKENS = ["[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]"]
+
+
+# ===========================================================================
+# Tokenizers
+# ===========================================================================
+class _PairEncoder:
+    """Mixin: encode a (text_a, text_b) pair into BERT-style features."""
+    cls_token: str = "[CLS]"
+    sep_token: str = "[SEP]"
+
+    def encode_pair(
+        self,
+        text_a: str,
+        text_b: Optional[str] = None,
+        max_len: int = 64,
+    ) -> Dict:
+        ta = self.tokenize(text_a)
+        tb = self.tokenize(text_b) if text_b is not None else []
+
+        # Reserve room for [CLS], [SEP], and (if pair) extra [SEP]
+        budget = max_len - (3 if text_b is not None else 2)
+        while len(ta) + len(tb) > budget and (ta or tb):
+            (ta if len(ta) >= len(tb) else tb).pop()
+
+        tokens = [self.cls_token] + ta + [self.sep_token]
+        span_a = (1, 1 + len(ta))
+        span_b = (0, 0)
+
+        if text_b is not None:
+            start = len(tokens)
+            tokens += tb + [self.sep_token]
+            span_b = (start, start + len(tb))
+
+        ids = self.convert_tokens_to_ids(tokens)
+        # token_type_ids: 0 for [CLS]+A+[SEP], 1 for B+[SEP]
+        n_a = 1 + len(ta) + 1
+        token_type_ids = [0] * n_a + [1] * (len(ids) - n_a)
+
+        return {
+            "tokens": tokens,
+            "input_ids": ids,
+            "token_type_ids": token_type_ids,
+            "attention_mask": [1] * len(ids),
+            "span_a": span_a,
+            "span_b": span_b,
+        }
+
+
+class SimpleTokenizer(_PairEncoder):
+    """Whitespace/punct tokenizer with a learnable vocab."""
+    kind = "simple"
+    TOKEN_RE = re.compile(r"\d+(?:[+\-*/]\d+)+|\w+|[^\w\s]", re.UNICODE)
+
+    def __init__(self, vocab: Optional[Dict[str, int]] = None):
+        if vocab:
+            self.vocab = dict(vocab)
+        else:
+            self.vocab = {t: i for i, t in enumerate(SPECIAL_TOKENS)}
+        self._inv()
+
+    def _inv(self):
+        self.inv = {i: t for t, i in self.vocab.items()}
+
+    def tokenize(self, text: str) -> List[str]:
+        return self.TOKEN_RE.findall(text.lower())
+
+    def build_vocab(
+        self,
+        texts: Sequence[str],
+        max_size: int = 30000,
+        min_freq: int = 1,
+    ) -> "SimpleTokenizer":
+        c = Counter(tok for t in texts for tok in self.tokenize(t))
+        for tok, f in c.most_common():
+            if len(self.vocab) >= max_size:
+                break
+            if f < min_freq:
+                break
+            if tok not in self.vocab:
+                self.vocab[tok] = len(self.vocab)
+        self._inv()
+        return self
+
+    def convert_tokens_to_ids(self, toks) -> List[int]:
+        unk = self.vocab["[UNK]"]
+        return [self.vocab.get(t, unk) for t in toks]
+
+    def convert_ids_to_tokens(self, ids) -> List[str]:
+        return [self.inv.get(int(i), "[UNK]") for i in ids]
+
+    pad_token_id  = property(lambda s: s.vocab["[PAD]"])
+    unk_token_id  = property(lambda s: s.vocab["[UNK]"])
+    cls_token_id  = property(lambda s: s.vocab["[CLS]"])
+    sep_token_id  = property(lambda s: s.vocab["[SEP]"])
+    mask_token_id = property(lambda s: s.vocab["[MASK]"])
+    vocab_size    = property(lambda s: len(s.vocab))
+
+    def state(self) -> Dict:
+        return {"kind": "simple", "vocab": self.vocab}
+
+
+class HFTokenizer(_PairEncoder):
+    """Thin wrapper around HuggingFace AutoTokenizer."""
+    kind = "hf"
+
+    def __init__(self, name: str = "bert-base-uncased"):
+        from transformers import AutoTokenizer  # local import to keep module light
+        self.name = name
+        self.tok = AutoTokenizer.from_pretrained(name)
+
+        # Robustly resolve the CLS/SEP *string* tokens
+        self.cls_token = self._resolve_special("cls_token", "cls_token_id")
+        self.sep_token = self._resolve_special("sep_token", "sep_token_id")
+
+    def _resolve_special(self, str_attr: str, id_attr: str) -> str:
+        # Try the string attribute first
+        tok = getattr(self.tok, str_attr, None)
+        if isinstance(tok, str) and tok:
+            return tok
+        # Fall back to id -> token
+        sid = getattr(self.tok, id_attr, None)
+        if sid is None:
+            raise ValueError(f"Tokenizer has neither '{str_attr}' nor '{id_attr}'")
+        return self.tok.convert_ids_to_tokens(int(sid))
+
+    def tokenize(self, text: str) -> List[str]:
+        return self.tok.tokenize(text)
+
+    def convert_tokens_to_ids(self, toks) -> List[int]:
+        return self.tok.convert_tokens_to_ids(list(toks))
+
+    def convert_ids_to_tokens(self, ids) -> List[str]:
+        return self.tok.convert_ids_to_tokens([int(i) for i in ids])
+
+    pad_token_id  = property(lambda s: s.tok.pad_token_id)
+    unk_token_id  = property(lambda s: s.tok.unk_token_id)
+    cls_token_id  = property(lambda s: s.tok.cls_token_id)
+    sep_token_id  = property(lambda s: s.tok.sep_token_id)
+    mask_token_id = property(lambda s: s.tok.mask_token_id)
+    vocab_size    = property(lambda s: len(s.tok))
+
+    def state(self) -> Dict:
+        return {"kind": "hf", "name": self.name}
+
+
+def get_tokenizer(
+    name: Optional[str] = "bert-base-uncased",
+    texts: Optional[Sequence[str]] = None,
+    allow_fallback: bool = True,
+):
+    """Return a HuggingFace tokenizer if possible, else a SimpleTokenizer."""
+    if name and name != "simple":
+        try:
+            return HFTokenizer(name)
+        except Exception as e:
+            if not allow_fallback:
+                raise
+            print(f"[data] HF tokenizer '{name}' unavailable ({type(e).__name__}); "
+                  f"using SimpleTokenizer")
+    corpus = list(texts or []) + mock_corpus()
+    return SimpleTokenizer().build_vocab(corpus)
+
+
+def tokenizer_from_state(state: Dict):
+    return HFTokenizer(state["name"]) if state["kind"] == "hf" else SimpleTokenizer(state["vocab"])
+
+
+# ===========================================================================
+# Mock data / alpha oracle
+# ===========================================================================
+def mock_corpus() -> List[str]:
+    return [
+        "Paris is capital of France",
+        "Berlin is capital of Germany",
+        "dog is an animal",
+        "car has a wheel",
+        "king is related to queen",
+        "5+3 equals 8",
+        "the cat sat on the mat",
+        "machine learning is a field of artificial intelligence",
+        "water boils at 100 degrees",
+        "the sun rises in the east",
+    ]
+
+
+def mock_alpha(shape) -> torch.Tensor:
+    """Random alpha tensor in [0, ALPHA_MAX], with a mix of weak/med/strong."""
+    t = torch.empty(shape).uniform_(0, 1)
+    u = torch.rand(shape)
+    a = torch.empty_like(t)
+
+    m = u < 0.45
+    a[m] = t[m] * 0.05
+    m = (u >= 0.45) & (u < 0.70)
+    a[m] = 0.15 + t[m] * 0.15
+    m = u >= 0.70
+    a[m] = 0.75 + t[m] * 0.20
+    return a.clamp_max(ALPHA_MAX)
+
+
+def mock_alpha_for_strength(strength: str, rng: random.Random) -> float:
+    if strength in ("strong", "high", "isA", "capitals"):
+        return rng.uniform(0.75, 0.95)
+    if strength in ("medium", "partOf"):
+        return rng.uniform(0.15, 0.30)
+    return rng.uniform(0.0, 0.05)
+
+
+def clean_wiki(text: str) -> List[str]:
+    """Split a Wikipedia extract into clean, non-trivial sentences."""
+    text = re.sub(r"\[\d+\]", " ", text)
+    paras = [p.strip() for p in text.split("\n") if len(p.strip()) > 40]
+    sents: List[str] = []
+    for p in paras:
+        parts = re.split(r"(?<=[.!?])\s+", p)
+        for s in parts:
+            s = s.strip()
+            wc = len(s.split())
+            if 6 <= wc and 30 < len(s) < 800:
+                sents.append(s)
+    return sents
+
+
+# ===========================================================================
+# Wikipedia loader (fast, batched, stdlib-only)
+# ===========================================================================
+def load_wikipedia_texts(n_docs: int = 100) -> List[str]:
+    """
+    Fast real Wikipedia loader:
+      - batch random titles (20 per request)
+      - batch extracts (20 titles per request)
+      - filter stubs < 800 chars / < 5 sentences
+      - cache to ./cache/wiki_{n_docs}_real.txt
+      - stdlib only (no pyarrow, no datasets)
+    """
+    cache_dir = os.path.join(os.path.dirname(__file__), "cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    cache_path = os.path.join(cache_dir, f"wiki_{n_docs}_real.txt")
+
+    # ---- 1. Cache hit ----
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                texts = [line.strip() for line in f if line.strip()]
+            if texts:
+                print(f"[data] Wikipedia CACHE HIT: {cache_path} "
+                      f"-> {len(texts)} sentences (instant)")
+                return texts
+        except Exception as e:
+            print(f"[data] cache read failed ({type(e).__name__}), refetching...")
+
+    print(f"[data] Fetching REAL Wikipedia API (FAST BATCH) for {n_docs} docs...")
+
+    try:
+        import urllib.parse
+        import urllib.request
+        import time
+
+        texts: List[str] = []
+        fetched = 0
+        attempts = 0
+        BATCH = 20
+        MAX_ATTEMPTS = max(10, n_docs * 2)
+
+        while fetched < n_docs and attempts < MAX_ATTEMPTS:
+            attempts += 1
+            try:
+                # --- random titles (batch) ---
+                rand_url = (
+                    "https://en.wikipedia.org/w/api.php"
+                    f"?action=query&list=random&rnnamespace=0&rnlimit={BATCH}&format=json"
+                )
+                req = urllib.request.Request(
+                    rand_url, headers={"User-Agent": "DualExpertBot/1.0"}
+                )
+                with urllib.request.urlopen(req, timeout=20) as r:
+                    data = json.loads(r.read().decode("utf-8"))
+                titles = [x["title"] for x in data["query"]["random"]]
+                if not titles:
+                    continue
+
+                # --- extracts (batch) ---
+                joined = "|".join(titles)
+                ext_url = (
+                    "https://en.wikipedia.org/w/api.php?action=query&prop=extracts"
+                    "&explaintext=1&exsectionformat=plain&exlimit=max&titles="
+                    + urllib.parse.quote(joined, safe="|")
+                    + "&format=json"
+                )
+                req2 = urllib.request.Request(
+                    ext_url, headers={"User-Agent": "DualExpertBot/1.0"}
+                )
+                with urllib.request.urlopen(req2, timeout=20) as r2:
+                    data2 = json.loads(r2.read().decode("utf-8"))
+
+                pages = data2.get("query", {}).get("pages", {})
+                for page in pages.values():
+                    extract = page.get("extract", "")
+                    if not extract or len(extract) < 800:
+                        continue
+                    sents = clean_wiki(extract)
+                    if len(sents) < 5:
+                        continue
+                    texts.extend(sents)
+                    fetched += 1
+                    if fetched >= n_docs:
+                        break
+
+                if fetched % 10 == 0 or fetched <= 5:
+                    print(f"[data] Wikipedia REAL BATCH: "
+                          f"{fetched}/{n_docs} docs, {len(texts)} sentences")
+
+                time.sleep(0.1)
+
+            except Exception:
+                time.sleep(0.5)
+                continue
+
+        if texts:
+            try:
+                with open(cache_path, "w", encoding="utf-8") as f:
+                    for s in texts:
+                        f.write(s.replace("\n", " ") + "\n")
+                print(f"[data] Wikipedia cache saved: {cache_path}")
+            except Exception as e:
+                print(f"[data] cache write failed: {type(e).__name__}")
+
+            avg = len(texts) // max(1, fetched)
+            print(f"[data] Wikipedia REAL (FAST): "
+                  f"{fetched} docs -> {len(texts)} sentences, avg {avg} sents/doc")
+            return texts
+
+    except Exception as e:
+        print(f"[data] Wikipedia API failed: {e}")
+
+    print("[data] All real methods failed, using mock_corpus fallback")
+    return mock_corpus() * max(20, n_docs)
+
+
+# ===========================================================================
+# D_alpha: synthetic pair builder + oracle attachment
+# ===========================================================================
+def _rec(q, k, label, source, rel_type, strength) -> Dict:
+    # NOTE: alpha starts as None (sentinel = "not yet attached")
+    return {
+        "q_text": q,
+        "k_text": k,
+        "label": int(label),
+        "source": source,
+        "rel_type": rel_type,
+        "strength": strength,
+        "alpha": None,
+    }
+
+
+def build_dalpha(
+    source: str = "synthetic",
+    n_per_source: int = 2000,
+    seed: int = 42,
+) -> List[Dict]:
+    """
+    Build a balanced synthetic set: `n_per_source` positives and
+    `n_per_source` negatives  => 2 * n_per_source records total.
+    """
+    rng = random.Random(seed)
+    recs: List[Dict] = []
+
+    templates = [
+        ("{a} is capital of {b}", "capitals", "strong"),
+        ("{a} is a type of {b}",   "isA",      "strong"),
+        ("{a} is part of {b}",     "partOf",   "medium"),
+        ("{a} is related to {b}",  "related",  "weak"),
+    ]
+    entities = [
+        ("Paris", "France"),
+        ("Berlin", "Germany"),
+        ("car", "wheel"),
+        ("dog", "animal"),
+        ("king", "queen"),
+        ("hand", "finger"),
+    ]
+
+    for _ in range(n_per_source):
+        a, b = rng.choice(entities)
+        tmpl, rtype, strength = rng.choice(templates)
+        recs.append(_rec(a, b, 1, source, rtype, strength))
+
+        # pick a negative `b2 != b`
+        b2 = b
+        for _try in range(5):
+            cand = rng.choice(entities)[0]
+            if cand != b:
+                b2 = cand
+                break
+        recs.append(_rec(a, b2, 0, source, "random", "none"))
+
+    print(f"[data] D_alpha {source}: {len(recs)} records "
+          f"({n_per_source} pos + {n_per_source} neg)")
+    return recs
+
+
+def attach_oracle(
+    records: List[Dict],
+    oracle: str = "mock",
+    seed: int = 42,
+    cache_path: Optional[str] = None,
+) -> List[Dict]:
+    """
+    Attach an 'alpha' value to each record.
+    Priority: cache (if present) > mock oracle.
+    Uses None as the "not yet attached" sentinel (NOT 0.5).
+    """
+    # ---- Optional cache ----
+    if cache_path and os.path.exists(cache_path):
+        try:
+            cache_data: Dict[str, float] = {}
+            with open(cache_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    obj = json.loads(line)
+                    key = obj.get("q_text", "") + "||" + obj.get("k_text", "")
+                    if "alpha" in obj:
+                        cache_data[key] = float(obj["alpha"])
+            applied = 0
+            for r in records:
+                key = r["q_text"] + "||" + r["k_text"]
+                if key in cache_data:
+                    r["alpha"] = cache_data[key]
+                    applied += 1
+            print(f"[data] Oracle cache {cache_path}: applied {applied} alphas")
+        except Exception as e:
+            print(f"[data] cache load failed ({type(e).__name__}): {e}")
+
+    # ---- Fill missing with mock oracle ----
+    rng = random.Random(seed + 1)
+    missing = 0
+    for r in records:
+        if r.get("alpha") is None:
+            r["alpha"] = mock_alpha_for_strength(r.get("strength", "none"), rng)
+            missing += 1
+    if missing:
+        print(f"[data] Oracle '{oracle}': filled {missing} alphas from mock")
+    return records
+
+
+def split_records(recs: List[Dict], ratios: Tuple[int, int, int] = (10, 1, 1),
+                  seed: int = 42) -> Tuple[List[Dict], List[Dict], List[Dict]]:
+    """Deterministic split using the given seed."""
+    rng = random.Random(seed)
+    recs = list(recs)          # don't mutate the caller's list
+    rng.shuffle(recs)
+    n = len(recs)
+    tot = sum(ratios)
+    a = n * ratios[0] // tot
+    b = a + n * ratios[1] // tot
+    return recs[:a], recs[a:b], recs[b:]
+
+
+# ===========================================================================
+# Datasets
+# ===========================================================================
+class PairDataset(Dataset):
+    def __init__(self, records: List[Dict], tokenizer, max_len: int = 64):
+        self.records = records
+        self.tok = tokenizer
+        self.max_len = max_len
+
+    def __len__(self) -> int:
+        return len(self.records)
+
+    def __getitem__(self, i: int) -> Dict:
+        r = self.records[i]
+        enc = self.tok.encode_pair(r["q_text"], r["k_text"], self.max_len)
+        enc["label"] = int(r["label"])
+        enc["alpha"] = float(r["alpha"])
+        return enc
+
+
+def collate_pairs(batch: List[Dict], pad_id: int) -> Dict:
+    B = len(batch)
+    T = max(len(b["input_ids"]) for b in batch)
+    ids = torch.full((B, T), pad_id, dtype=torch.long)
+    tt  = torch.zeros((B, T), dtype=torch.long)
+    am  = torch.zeros((B, T), dtype=torch.long)
+    alpha = torch.full((B, T, T), float("nan"))
+
+    for i, b in enumerate(batch):
+        L = len(b["input_ids"])
+        ids[i, :L] = torch.tensor(b["input_ids"], dtype=torch.long)
+        tt[i, :L]  = torch.tensor(b["token_type_ids"], dtype=torch.long)
+        am[i, :L]  = 1
+
+        (a0, a1), (b0, b1) = b["span_a"], b["span_b"]
+        if a1 > a0 and b1 > b0:
+            alpha[i, a0:a1, b0:b1] = float(b["alpha"])
+
+    return {
+        "input_ids": ids,
+        "token_type_ids": tt,
+        "attention_mask": am,
+        "labels": torch.tensor([b["label"] for b in batch], dtype=torch.long),
+        "alpha_oracle": alpha,
+    }
+
+
+class WikiMLMDataset(Dataset):
+    """Pack sentences into fixed-length chunks for MLM."""
+    def __init__(self, texts: Sequence[str], tokenizer, max_len: int = 128):
+        self.tok = tokenizer
+        self.chunks: List[List[str]] = []
+        buf: List[str] = []
+        L = max_len - 2  # room for [CLS], [SEP]
+        for t in texts:
+            buf += tokenizer.tokenize(t)
+            while len(buf) >= L:
+                self.chunks.append(buf[:L])
+                buf = buf[L:]
+        if buf:
+            self.chunks.append(buf)
+
+    def __len__(self) -> int:
+        return len(self.chunks)
+
+    def __getitem__(self, i: int) -> Dict:
+        toks = [self.tok.cls_token] + self.chunks[i] + [self.tok.sep_token]
+        return {"input_ids": self.tok.convert_tokens_to_ids(toks)}
+
+
+def _random_token_ids(n: int, tok, generator: Optional[torch.Generator] = None) -> torch.Tensor:
+    """Sample n token ids excluding all special tokens."""
+    specials = {
+        tok.pad_token_id, tok.unk_token_id, tok.cls_token_id,
+        tok.sep_token_id, tok.mask_token_id,
+    }
+    specials = {int(s) for s in specials if s is not None}
+
+    out = torch.randint(0, tok.vocab_size, (n,), generator=generator)
+    if specials:
+        specials_t = torch.tensor(sorted(specials), dtype=torch.long)
+        for _ in range(10):  # a few resample rounds are enough
+            bad = torch.isin(out, specials_t)
+            if not bad.any():
+                break
+            out[bad] = torch.randint(0, tok.vocab_size,
+                                     (int(bad.sum()),), generator=generator)
+    return out
+
+
+def collate_mlm(
+    batch: List[Dict],
+    tok,
+    mlm_prob: float = 0.15,
+    alpha_mode: str = "mock",
+    generator: Optional[torch.Generator] = None,
+) -> Dict:
+    B = len(batch)
+    T = max(len(b["input_ids"]) for b in batch)
+
+    ids = torch.full((B, T), tok.pad_token_id, dtype=torch.long)
+    am  = torch.zeros((B, T), dtype=torch.long)
+    for i, b in enumerate(batch):
+        L = len(b["input_ids"])
+        ids[i, :L] = torch.tensor(b["input_ids"], dtype=torch.long)
+        am[i, :L]  = 1
+
+    special = (ids == tok.cls_token_id) | (ids == tok.sep_token_id) | (am == 0)
+    pick = (torch.rand(B, T, generator=generator) < mlm_prob) & ~special
+
+    # ensure at least one masked token per sequence
+    for i in range(B):
+        if not pick[i].any():
+            cand = (~special[i]).nonzero().flatten()
+            if len(cand):
+                j = int(torch.randint(len(cand), (1,), generator=generator).item())
+                pick[i, int(cand[j])] = True
+
+    labels = torch.where(pick, ids, torch.full_like(ids, -100))
+
+    # 80% -> [MASK], 10% -> random, 10% -> keep
+    r = torch.rand(B, T, generator=generator)
+    inp = ids.clone()
+
+    m_mask = pick & (r < 0.8)
+    inp[m_mask] = tok.mask_token_id
+
+    m_rnd = pick & (r >= 0.8) & (r < 0.9)
+    n_rnd = int(m_rnd.sum())
+    if n_rnd > 0:
+        inp[m_rnd] = _random_token_ids(n_rnd, tok, generator=generator)
+
+    out = {
+        "input_ids": inp,
+        "attention_mask": am,
+        "token_type_ids": torch.zeros_like(ids),
+        "labels": labels,
+    }
+
+    if alpha_mode == "mock":
+        a = mock_alpha((B, T, T))
+        valid = am.bool()[:, :, None] & am.bool()[:, None, :]
+        out["alpha_oracle"] = a.masked_fill(~valid, float("nan"))
+
+    return out
+
+
+# ===========================================================================
+# DataLoader factory
+# ===========================================================================
+def build_dataloaders(
+    data_source: str = "dalpha",
+    batch_size: int = 128,
+    max_len: int = 64,
+    oracle: str = "mock",
+    seed: int = 42,
+    tokenizer=None,
+    tokenizer_name: str = "bert-base-uncased",
+    n_docs: int = 100,
+    dalpha_source: str = "synthetic",
+    n_per_source: int = 2000,
+    wiki_alpha: str = "mock",
+    oracle_cache: Optional[str] = None,
+) -> Dict:
+    torch_gen = torch.Generator().manual_seed(seed)
+
+    if data_source == "wikipedia":
+        texts = load_wikipedia_texts(n_docs)
+        random.Random(seed).shuffle(texts)
+        tok = tokenizer or get_tokenizer(tokenizer_name, texts)
+
+        n = len(texts)
+        if n < 10:
+            texts = texts + mock_corpus() * 20
+            n = len(texts)
+
+        i90, i95 = int(0.9 * n), int(0.95 * n)
+        parts = (texts[:i90], texts[i90:i95], texts[i95:])
+
+        # guard against empty splits
+        parts = tuple(p if len(p) >= 5 else texts[:10] for p in parts)
+
+        dsets = [WikiMLMDataset(p, tok, max_len) for p in parts]
+        col = partial(collate_mlm, tok=tok, alpha_mode=wiki_alpha,
+                      generator=torch_gen)
+        task = "mlm"
+        if wiki_alpha == "mock":
+            print("[data] wikipedia + mock alpha: graded RANDOM oracle")
+
+    elif data_source in ("dalpha", "hf"):
+        recs = build_dalpha(dalpha_source, n_per_source, seed)
+        recs = attach_oracle(recs, oracle, seed, oracle_cache)
+        tr, va, te = split_records(recs, seed=seed)
+
+        if tokenizer is not None:
+            tok = tokenizer
+        elif data_source == "hf":
+            tok = get_tokenizer(tokenizer_name, allow_fallback=False)
+        else:
+            corpus = [r["q_text"] + " " + r["k_text"] for r in recs]
+            tok = get_tokenizer(tokenizer_name, corpus)
+
+        dsets = [PairDataset(p, tok, max_len) for p in (tr, va, te)]
+        col = partial(collate_pairs, pad_id=tok.pad_token_id)
+        task = "cls"
+
+    else:
+        raise ValueError(f"Unknown data_source: {data_source}")
+
+    def _mk(ds: Dataset, shuffle: bool) -> DataLoader:
+        return DataLoader(
+            ds,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            collate_fn=col,
+            generator=torch_gen,
+            drop_last=shuffle,  # avoids tiny last batch during training
+        )
+
+    return {
+        "train": _mk(dsets[0], True),
+        "val":   _mk(dsets[1], False),
+        "test":  _mk(dsets[2], False),
+        "tokenizer": tok,
+        "task": task,
+        "n_classes": 2,
+    }
+
+
+# ===========================================================================
+# Smoke test
+# ===========================================================================
+if __name__ == "__main__":
+    print("Testing fast Wikipedia loader...")
+    texts = load_wikipedia_texts(20)
+    print(f"Got {len(texts)} sentences, sample: {texts[:2]}")
+
+    print("\nTesting dalpha pipeline...")
+    loaders = build_dataloaders(data_source="dalpha", batch_size=8, n_per_source=32)
+    batch = next(iter(loaders["train"]))
+    for k, v in batch.items():
+        if torch.is_tensor(v):
+            print(f"  {k}: shape={tuple(v.shape)}, dtype={v.dtype}")
+        else:
+            print(f"  {k}: {type(v).__name__}")
